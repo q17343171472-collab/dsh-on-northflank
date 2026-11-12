@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# DSH on Northflank — 容器入口
+# DSH 容器入口（Northflank / Render / 任何 Docker 平台通用）
 set -euo pipefail
 
 DSH_HOME="${DSH_HOME:-/data/dsh}"
 DSH_TEMPLATE_HOME="${DSH_TEMPLATE_HOME:-/opt/dsh-template}"
 DSH_PORT="${DSH_PORT:-3080}"
+# 对外监听端口：Render / Railway 之类会注入 PORT，Northflank 走 8080 默认值
+WEB_PORT="${PORT:-8080}"
 export DSH_HOME
 
 # nginx 需要写 pid/log 目录
@@ -25,14 +27,14 @@ if [ -f "$DSH_TEMPLATE_HOME/profiles/web/cordis.patch.yml" ]; then
   cp -a "$DSH_TEMPLATE_HOME/profiles/web/cordis.patch.yml" "$DSH_HOME/profiles/web/cordis.patch.yml"
 fi
 
-# ── 2. 凭证注入：把 Northflank secret group 注入的环境变量写进 credentials.yaml ──
+# ── 2. 凭证注入：把平台注入的环境变量写进 credentials.yaml ──
 if [ -f /app/scripts/merge-credentials.mjs ]; then
   NODE_PATH="$(npm root -g)" node /app/scripts/merge-credentials.mjs || log "WARNING: credential merge failed"
 fi
 
 # ── 3. 组装 dsh 启动参数 ────────────────────────────────────────────────
-# --trusted-host 可重复，用逗号分隔多个域名
-# Northflank 的环境变量名不允许下划线，平台上注入的是 DSH-TRUSTED-HOST /
+# --trusted-host 可重复，用逗号分隔多个域名。
+# 有的平台（Northflank）变量名不允许下划线，注入的是 DSH-TRUSTED-HOST /
 # DSH-PUBLIC-URL，这里用 printenv 兼容两种写法。
 env_get() {
   local v
@@ -88,5 +90,15 @@ if grep -qE 'dsh web: https?://' "$DSH_HOME/dsh.log" 2>/dev/null; then
 fi
 
 # ── 5. nginx 前台运行（PID 1 语义由 tini 承担） ─────────────────────────
-nginx -t
-exec nginx -g 'daemon off;'
+# 平台注入的 PORT 不是 8080 时，生成一份改过端口的配置（Render 默认 10000）
+NGINX_CONF=/etc/nginx/nginx.conf
+if [ "$WEB_PORT" != "8080" ]; then
+  NGINX_CONF=/tmp/nginx.conf
+  log "rewriting nginx listen port 8080 -> $WEB_PORT"
+  sed -e "s/listen 8080 default_server;/listen ${WEB_PORT} default_server;/" \
+      -e "s/listen \[::\]:8080 default_server;/listen [::]:${WEB_PORT} default_server;/" \
+      /etc/nginx/nginx.conf > "$NGINX_CONF"
+fi
+log "web port: $WEB_PORT"
+nginx -t -c "$NGINX_CONF"
+exec nginx -c "$NGINX_CONF" -g 'daemon off;'
