@@ -6,7 +6,7 @@
 #   2. 把平台注入的环境变量合并进 credentials.yaml（密钥只走环境变量，不进镜像/仓库）
 #   3. 启动 dsh web（只监听 127.0.0.1），等它打印带 token 的登录 URL
 #   4. nginx 监听平台指定端口并反代到 dsh（动态端口：平台注入 PORT，Render 默认 10000）
-#   5. dsh 一旦退出就退出容器，让平台重启，避免 nginx 对着死上游一直 502
+#   5. dsh 一旦退出就退出容器，让平台重启，避免 nginx 对着死上游返回 502
 set -euo pipefail
 
 DSH_HOME="${DSH_HOME:-/data/dsh}"
@@ -32,6 +32,16 @@ fi
 if [ -f "$DSH_TEMPLATE_HOME/profiles/web/cordis.patch.yml" ]; then
   cp -a "$DSH_TEMPLATE_HOME/profiles/web/cordis.patch.yml" "$DSH_HOME/profiles/web/cordis.patch.yml"
 fi
+
+# ── 1.5 启动自检：把磁盘 / 内存 / CPU 的真实数字打进日志 ──────────────────
+# 免费实例资源很少（Render Free = 512 MB / 0.1 CPU / 临时文件系统），先看清家底，
+# 以后再装 skill / MCP / 插件时就知道还剩多少空间。
+log "── 资源自检 ─────────────────────────────────"
+while IFS= read -r line; do log "  $line"; done < <(df -h / /data 2>/dev/null || true)
+log "  内存: $(grep -E '^(MemTotal|MemAvailable)' /proc/meminfo 2>/dev/null | tr -s ' ' | tr '\n' ' ')"
+log "  CPU: $(nproc 2>/dev/null || echo '?') 核   node: $(node -v 2>/dev/null || echo '?')   pnpm: $(pnpm -v 2>/dev/null || echo '?')"
+log "  DSH_HOME 已用: $(du -sh "$DSH_HOME" 2>/dev/null | cut -f1 || echo '?')"
+log "────────────────────────────────────────────"
 
 # ── 2. 凭证注入：环境变量 → credentials.yaml ──────────────────────────────
 if [ -f /app/scripts/merge-credentials.mjs ]; then
@@ -80,7 +90,7 @@ term() {
 }
 trap term TERM INT
 
-# 等 DSH 打印启动 URL（里面带一次性 token）；最多等 150 秒
+# 等 DSH 打印启动 URL（里面带 token）；最多等 150 秒
 for _ in $(seq 1 150); do
   if grep -qE 'dsh web: https?://' "$DSH_HOME/dsh.log" 2>/dev/null; then break; fi
   if grep -q 'startup failed' "$DSH_HOME/dsh.log" 2>/dev/null; then break; fi
@@ -97,7 +107,7 @@ if grep -qE 'dsh web: https?://' "$DSH_HOME/dsh.log" 2>/dev/null; then
   URL="$(grep -oE 'dsh web: https?://[^ ]+' "$DSH_HOME/dsh.log" | tail -n1)"
   printf '%s\n' "$URL" > "$DSH_HOME/public-url.txt"
   log "launch url (含 token): $URL"
-  log "★ 用手机打开这一行的网址即可登录（令牌是一次性的，登录后会换成 30 天 cookie）"
+  log "★ 用手机打开这一行的网址即可登录（令牌可重复使用，登录后换成 30 天 cookie）"
 else
   log "!! 等不到 dsh web 的启动 URL（150 秒超时），日志尾部："
   tail -n 30 "$DSH_HOME/dsh.log" || true
