@@ -1,0 +1,38 @@
+# 让 Render 免费实例 24 小时常亮。
+#
+# 背景：Render 免费 Web Service 在「15 分钟内没有任何入站流量」时会休眠（spin down），
+# 下次访问要等 30~60 秒冷启动。用一个每 10 分钟跑一次的外部请求把它叫醒即可。
+#
+# 为什么用 GitHub Actions：不需要注册任何额外服务、不需要信用卡、不依赖你自己的电脑开机。
+# 访问 https://dsh-yycc.onrender.com/ 返回 401 是正常的（DSH 需要登录 cookie），
+# 但这一次请求就足够算作「有入站流量」，实例不会休眠。
+#
+# 注：
+#   - GitHub 的定时任务在高峰期可能延迟几分钟，对「防 15 分钟休眠」来说完全够用。
+#   - 仓库连续 60 天没有任何提交时，GitHub 会自动暂停定时工作流；随便改点东西即可恢复。
+
+name: keepalive
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping the DSH web service
+        run: |
+          set -u
+          URL="https://dsh-yycc.onrender.com/"
+          for i in 1 2 3; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' -m 90 "$URL" || true)
+            echo "attempt $i -> HTTP $code"
+            if [ "$code" != "000" ]; then
+              echo "实例已叫醒（401 = 需要登录，属于正常）。"
+              exit 0
+            fi
+            sleep 20
+          done
+          echo "三次都没连上（可能正在冷启动，等下一次定时任务即可）"
