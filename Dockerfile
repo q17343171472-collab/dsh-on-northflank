@@ -35,23 +35,25 @@ RUN npm install -g \
       js-yaml@4 \
     && npm cache clean --force
 
-# 目录选择器（browse）不要用 `npm i -g` 装：
-# peer 依赖指向未发布的 @deepseek-ai/dsh-paths@^0.0.1-rc.1，npm 会直接 404（实测构建失败）。
-# 正确做法是在 profile 里用 pnpm 装（见下面的 RUN），因为 pnpm-workspace.yaml 设了
-# autoInstallPeers: false，不会去解析那些未发布的 peer。
-# headless 容器里 auto 选择器会自动选 browse 后端。
+# 目录选择器（browse）绝对不要自己装，两种装法都会坏：
+#  1) `npm i -g @deepseek-ai/dsh-host-directory-picker-browse` → 构建直接失败：
+#     peer 依赖指向未发布的 @deepseek-ai/dsh-paths@^0.0.1-rc.1，npm 报 404。
+#  2) 在 profile 里 `pnpm add` 这两个包（不写版本）→ pnpm 装的是 npm 上的 dist-tag latest，
+#     而这两个包的 latest 还停在远古的 0.0.1-rc.1 / 0.0.1-rc.3；它们的客户端半边会
+#     require('@deepseek-ai/dsh-client-runtime/client')，那个包在 npm 上只发到 0.1.1-rc.2，
+#     模块表对不上 ⇒ 网页起来后直接 “Failed to load plugins / web boot: 2 entries did not activate”。
+# 正确做法：什么都不装。@deepseek-ai/dsh-web-app@0.2.2-rc.1 已经依赖了同版本的
+# dsh-host-directory-picker-{auto,browse,native} 与 dsh-client-ui-directory-picker-{browse,native}，
+# 它们就在全局安装树 /usr/local/lib/node_modules 里，profile 的 directory-picker 行会自动解析到
+# dsh-host-directory-picker-auto；headless 容器里 auto 会自己选 browse 后端。
 
-# 构建期就生成好 profile（bundles + dsh-im + ds-harness-remote + browse picker），运行时只做拷贝
+# 构建期就生成好 profile（bundles + dsh-im + ds-harness-remote），运行时只做拷贝
 # ds-harness-remote 0.6.4 = 手机远程接入插件（P2P + 端到端加密，手机端用 DSH Go / Remote App 配对）
 # 注：`dsh plugin --profile <name> <pnpm-args...>` 会把参数原样交给 pnpm，
 # 所以这里等价于 `pnpm add -w <两个包>`（-w 只能出现一次，两个包名跟在后面）。
 RUN DSH_HOME=/opt/dsh-template dsh plugin --profile web add -w \
         @xmanrui/dsh-im \
-        ds-harness-remote@0.6.4 \
-    && cd /opt/dsh-template/profiles/web \
-    && pnpm add \
-          @deepseek-ai/dsh-host-directory-picker-browse \
-          @deepseek-ai/dsh-client-ui-directory-picker-browse
+        ds-harness-remote@0.6.4
 
 WORKDIR /app
 COPY profile/cordis.patch.yml   /opt/dsh-template/profiles/web/cordis.patch.yml
