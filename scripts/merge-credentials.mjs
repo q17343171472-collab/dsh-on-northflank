@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * 把 Northflank secret group 注入的环境变量写进 DSH 的本地凭证文件。
+ * 把平台注入的环境变量写进 DSH 的本地凭证文件。
  *
  *   $DSH_HOME/.credentials.yaml
  *     version: 1
@@ -8,7 +8,7 @@
  *     refs:    { KEY: value }
  *
  * 环境变量 → refs 的映射由 DSH_SECRET_REFS 决定（逗号分隔，默认见下），
- * 这样不会把 NORTHFLANK_* / 平台内部变量误写进凭证文件。
+ * 这样不会把平台内部变量误写进凭证文件。
  */
 import { createRequire } from 'node:module'
 import { execSync } from 'node:child_process'
@@ -18,12 +18,31 @@ import path from 'node:path'
 const require = createRequire(import.meta.url)
 
 function loadYaml() {
+  const tried = []
+  const candidates = []
+  // 1) 正常路径：NODE_PATH / 本地依赖
+  candidates.push(() => require('js-yaml'))
+  // 2) 全局 npm root
+  let globalRoot = ''
   try {
-    return require('js-yaml')
-  } catch {
-    const root = execSync('npm root -g', { encoding: 'utf8' }).trim()
-    return createRequire(path.join(root, 'index.js'))('js-yaml')
+    globalRoot = execSync('npm root -g', { encoding: 'utf8' }).trim()
+  } catch {}
+  if (globalRoot) {
+    candidates.push(() => require(path.join(globalRoot, 'js-yaml')))
+    // 3) dsh 自己的依赖树（js-yaml 是 @deepseek-ai/dsh 的运行时依赖）
+    candidates.push(() =>
+      createRequire(path.join(globalRoot, '@deepseek-ai', 'dsh', 'index.js'))('js-yaml')
+    )
   }
+  for (const load of candidates) {
+    try {
+      const mod = load()
+      if (mod) return mod
+    } catch (err) {
+      tried.push(err.code || err.message)
+    }
+  }
+  throw new Error(`找不到 js-yaml（尝试：${tried.join(' / ') || '无'}）`)
 }
 
 const yaml = loadYaml()
@@ -65,9 +84,8 @@ doc.refs ||= {}
 
 const written = []
 for (const name of refNames) {
-  // Northflank 的 secret group / runtimeEnvironment 变量名只允许
-  // 字母、数字、连字符、斜杠和点 —— 下划线会被拒收，
-  // 所以 DEEPSEEK_API_KEY 在平台上以 DEEPSEEK-API-KEY 的形式注入。
+  // Northflank 这类平台的变量名只允许字母、数字、连字符、斜杠和点，
+  // 下划线会被拒收，所以 DEEPSEEK_API_KEY 可能以 DEEPSEEK-API-KEY 的形式注入。
   // 两种写法都查一次，写进 refs 时统一还原成下划线形态。
   const candidates = [name, name.replace(/_/g, '-')]
   let value
@@ -92,6 +110,19 @@ if (process.env.DSH_CREDENTIALS_RECORDS) {
   } catch (err) {
     console.error('[merge-credentials] DSH_CREDENTIALS_RECORDS 解析失败：', err.message)
   }
+}
+
+// 可选：固定浏览器会话签名密钥。
+// DSH 启动时用 client-connection/browser-session 这个 secret 给 cookie 签名，
+// 把它钉死之后，容器重启 / 重新部署后旧的 30 天 cookie 依然有效，
+// 用户不必每次重启后重新去日志里找新的 ?token= 链接。
+const sessionSecret = process.env.DSH_BROWSER_SESSION_SECRET
+if (sessionSecret) {
+  doc.records['client-connection/browser-session'] = {
+    kind: 'grant',
+    payload: { version: 1, secret: sessionSecret },
+  }
+  written.push('DSH_BROWSER_SESSION_SECRET')
 }
 
 fs.mkdirSync(HOME, { recursive: true })
