@@ -47,12 +47,16 @@ RUN npm install -g \
 # 它们就在全局安装树 /usr/local/lib/node_modules 里，profile 的 directory-picker 行会自动解析到
 # dsh-host-directory-picker-auto；headless 容器里 auto 会自己选 browse 后端。
 
-# 构建期就生成好 profile（bundles + dsh-im + ds-harness-remote），运行时只做拷贝
+# 构建期就生成好 profile（bundles + ds-harness-remote）
 # ds-harness-remote 0.6.4 = 手机远程接入插件（P2P + 端到端加密，手机端用 DSH Go / Remote App 配对）
 # 注：`dsh plugin --profile <name> <pnpm-args...>` 会把参数原样交给 pnpm，
-# 所以这里等价于 `pnpm add -w <两个包>`（-w 只能出现一次，两个包名跟在后面）。
+# 所以这里等价于 `pnpm add -w <包名>`（-w 只能出现一次，包名跟在后面）。
+#
+# 2026-11-13：已移除 @xmanrui/dsh-im（IM 机器人插件，11 个 IM 平台 SDK）。
+#   本机单一配置实测：im 占稳态内存 ≈56 MB（B 配置 215 MB vs A 配置 156 MB），
+#   Render 免费层 512 MB 上限下常驻已用 ≈430 MB，去掉 im 可回收这部分留白。
+#   需要 IM 遥控时再加回来：`-w @xmanrui/dsh-im` 或用 `dsh plugin --profile web add -w @xmanrui/dsh-im`。
 RUN DSH_HOME=/opt/dsh-template dsh plugin --profile web add -w \
-        @xmanrui/dsh-im \
         ds-harness-remote@0.6.4
 
 WORKDIR /app
