@@ -4,6 +4,7 @@
 # 流程：
 #   1. 首次运行时把镜像内烘焙好的 profile 拷到可写目录
 #   2. 把平台注入的环境变量合并进 credentials.yaml（密钥只走环境变量，不进镜像/仓库）
+#   2.5 从 DSH_REMOTE_STATE_B64 还原手机配对状态（免费层文件系统是临时的，不还原就每次重新配对）
 #   3. 启动 dsh web（只监听 127.0.0.1），等它打印带 token 的登录 URL
 #   4. nginx 监听平台指定端口并反代到 dsh（动态端口：平台注入 PORT，Render 默认 10000）
 #   5. dsh 一旦退出就退出容器，让平台重启，避免 nginx 对着死上游返回 502
@@ -16,9 +17,23 @@ DSH_PORT="${DSH_PORT:-3080}"
 WEB_PORT="${PORT:-8080}"
 export DSH_HOME
 
+# ds-harness-remote 的全部身份/配对状态都在这里。
+# 目录名 servers/<scope> 是对中继 origin 的 sha256 前 24 位，
+# 中继固定为 https://dsh.r2049.cn ⇒ scope 恒为 e9988d504cda7c1541adafcc，
+# 所以整棵树可以原样备份/还原，位置不会漂。
+REMOTE_ROOT="$DSH_HOME/ds-harness-remote"
+
 mkdir -p /var/log/nginx /var/lib/nginx /run
 
 log() { printf '[entrypoint] %s\n' "$*"; }
+
+# 平台差异：有的平台不允许环境变量名带下划线，所以两种写法都兼容
+env_get() {
+  local v
+  v="$(printenv "$1" 2>/dev/null || true)"
+  if [ -z "$v" ]; then v="$(printenv "$2" 2>/dev/null || true)"; fi
+  printf '%s' "$v"
+}
 
 # ── 1. profile 初始化（模板 → 可写目录，只在首次执行时拷贝） ──────────────
 mkdir -p "$DSH_HOME/profiles/web"
@@ -37,7 +52,7 @@ fi
 # 免费实例资源很少（Render Free = 512 MB / 0.1 CPU / 临时文件系统），先看清家底，
 # 以后再装 skill / MCP / 插件时就知道还剩多少空间。
 log "── 资源自检 ─────────────────────────────────"
-while IFS= read -r line; do log "  $line"; done < <(df -h / /data 2>/dev/null || true)
+log "  磁盘: $(df -h / /data 2>/dev/null | tr -s ' \t' '  ' | tr '\n' '|' || true)"
 log "  内存: $(grep -E '^(MemTotal|MemAvailable)' /proc/meminfo 2>/dev/null | tr -s ' ' | tr '\n' ' ')"
 log "  CPU: $(nproc 2>/dev/null || echo '?') 核   node: $(node -v 2>/dev/null || echo '?')   pnpm: $(pnpm -v 2>/dev/null || echo '?')"
 log "  DSH_HOME 已用: $(du -sh "$DSH_HOME" 2>/dev/null | cut -f1 || echo '?')"
@@ -48,15 +63,41 @@ if [ -f /app/scripts/merge-credentials.mjs ]; then
   NODE_PATH="$(npm root -g)" node /app/scripts/merge-credentials.mjs || log "WARNING: credential merge failed"
 fi
 
+# ── 2.5 还原手机配对状态（关键：免费层每次 deploy/restart/spin-down 都清空磁盘） ──
+# 首次配对后由 watchdog 把 tar.gz 的 base64 打进日志，粘进 Render 环境变量
+# DSH_REMOTE_STATE_B64（Render 不允许下划线时用 DSH-REMOTE-STATE-B64）。
+# 之后每次冷启动在这里还原，手机端不需要重新扫码。
+remote_state_restore() {
+  local b64 tmp
+  b64="$(env_get DSH_REMOTE_STATE_B64 DSH-REMOTE-STATE-B64)"
+  if [ -z "$b64" ]; then
+    log "remote state: 环境变量未设置（首次启用此功能，或还没配对过）→ 走全新身份"
+    return 0
+  fi
+  if [ -d "$REMOTE_ROOT/servers" ] && [ -n "$(ls -A "$REMOTE_ROOT/servers" 2>/dev/null || true)" ]; then
+    log "remote state: 磁盘上已有身份，跳过还原"
+    return 0
+  fi
+  log "remote state: 从环境变量还原（${#b64} 字符 base64）"
+  tmp="$(mktemp -d)"
+  if printf '%s' "$b64" | base64 -d > "$tmp/state.tar.gz" 2>/dev/null && [ -s "$tmp/state.tar.gz" ]; then
+    if tar -xzf "$tmp/state.tar.gz" -C "$DSH_HOME" 2>/dev/null; then
+      # identity-store 在 linux 上强制校验 device.key / pairing 文件必须是 0600，否则启动直接抛 IDENTITY_INVALID
+      find "$REMOTE_ROOT" -type f \( -name '*.key' -o -name 'host-pairing.json' -o -name 'pairing-host-only.json' \) -exec chmod 600 {} + 2>/dev/null || true
+      chmod 700 "$REMOTE_ROOT" 2>/dev/null || true
+      log "remote state: 还原完成（$(du -sh "$REMOTE_ROOT" 2>/dev/null | cut -f1)）"
+    else
+      log "WARNING: remote state 解包失败，按全新身份启动（手机端需要再配一次）"
+    fi
+  else
+    log "WARNING: DSH_REMOTE_STATE_B64 不是合法 base64，忽略"
+  fi
+  rm -rf "$tmp"
+}
+remote_state_restore
+
 # ── 3. 组装 dsh 启动参数 ────────────────────────────────────────────────
 # --trusted-host 可重复，用逗号分隔多个域名。
-# 有的平台不允许环境变量名带下划线，所以两种写法都兼容。
-env_get() {
-  local v
-  v="$(printenv "$1" 2>/dev/null || true)"
-  if [ -z "$v" ]; then v="$(printenv "$2" 2>/dev/null || true)"; fi
-  printf '%s' "$v"
-}
 TRUSTED_HOSTS="$(env_get DSH_TRUSTED_HOST DSH-TRUSTED-HOST)"
 PUBLIC_URL="$(env_get DSH_PUBLIC_URL DSH-PUBLIC-URL)"
 : "${TRUSTED_HOSTS:=localhost}"
@@ -113,6 +154,44 @@ else
   tail -n 30 "$DSH_HOME/dsh.log" || true
   exit 1
 fi
+
+# ── 4.5 配对状态导出 watchdog ────────────────────────────────────────────
+# 免费层没有 shell、没有持久磁盘，所以把「导出」做成日志通道：
+# 状态一变（= 手机刚配对成功 / 中继重新注册），就把整棵 ds-harness-remote 打成
+# tar.gz 再 base64，按 1000 字符一块打到日志里。把 [rs-XXXofYYY] 后面的内容
+# 按顺序拼起来，就是 DSH_REMOTE_STATE_B64 的完整值。只在变化时打，不刷屏。
+remote_state_dump() {
+  [ -d "$REMOTE_ROOT/servers" ] || return 0
+  local blob chunk i total
+  blob="$( cd "$DSH_HOME" && tar -czf - ds-harness-remote 2>/dev/null | base64 -w0 )"
+  [ -n "$blob" ] || return 0
+  total=$(( (${#blob} + 999) / 1000 ))
+  log "remote state snapshot: ${#blob} 字符 / $total 块 —— 拼起来即为 DSH_REMOTE_STATE_B64"
+  i=0
+  while [ $i -lt $total ]; do
+    chunk="$(printf '%s' "$blob" | cut -c$((i*1000+1))-$(((i+1)*1000)))"
+    log "[rs-$(printf '%03d' $((i+1)))of$(printf '%03d' $total)] $chunk"
+    i=$((i+1))
+  done
+}
+
+remote_state_watch() {
+  local sig prev="__init__" last=0 now
+  while true; do
+    sleep 15
+    # 整棵树取指纹：配对、中继注册、凭证续期都会改文件，不能只盯一个
+    sig="$( (find "$REMOTE_ROOT" -type f -print0 2>/dev/null | xargs -0 -r md5sum 2>/dev/null | sort) | md5sum 2>/dev/null | cut -d' ' -f1 || true)"
+    if [ -z "$sig" ]; then continue; fi
+    now="$(date +%s)"
+    if [ "$sig" != "$prev" ] && [ $((now - last)) -ge 60 ]; then
+      prev="$sig"
+      last="$now"
+      log "remote state: 检测到状态变化，导出快照"
+      remote_state_dump || true
+    fi
+  done
+}
+remote_state_watch &
 
 # ── 5. nginx 反代（动态端口） ───────────────────────────────────────────
 NGINX_CONF=/etc/nginx/nginx.conf
