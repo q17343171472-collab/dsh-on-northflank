@@ -1,0 +1,48 @@
+# 让 Hugging Face 免费 Space 不被 48 小时休眠。
+#
+# 背景：HF 免费硬件（含 ZeroGPU）在「48 小时内没有任何入站流量」时会被自动暂停
+# （paused）。暂停后数据不会丢（数据都在 dataset YAN11365/magpie-data 里，
+# 唤醒后自动拉回），但下次访问要等 2~3 分钟冷启动。
+#
+# 这个工作流站在「外部访客」的位置每 6 小时请求一次 Space 的公网地址，
+# 让 HF 的活跃计时器一直清零。它同时也能把已经睡着的 Space 叫醒。
+#
+# 为什么是 6 小时：HF 的门槛是 48 小时，6 小时一次绰绰有余。**千万不要把间隔设成分钟级**
+# —— 社区里有实例（discuss.huggingface.co/t/keepalive-ping-get-health-ready-every-2-minutes/176238）
+# 用 Cloudflare Worker 每 2 分钟 ping 自己的 Space，被反滥用系统判定为攻击，
+# Space 被 "Flagged as abusive" 暂停，只能邮件申诉。
+#
+# 注：
+#   - /__status 会返回 {"magpie": true, "keepalive": {...}}，200 即代表 Space 活着、magpie 进程在跑。
+#   - Space 正在冷启动时 curl 可能拿不到 200，重试几次即可；都不成功也没关系，下一次会再试。
+#   - 仓库连续 60 天没有任何提交时，GitHub 会自动暂停定时工作流；随便改点东西即可恢复。
+
+name: keepalive-magpie
+
+on:
+  schedule:
+    - cron: "23 */6 * * *"
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping the HF Space (wake it if asleep)
+        run: |
+          set -u
+          URL="https://yan11365-magpie-free.hf.space/__status"
+          for i in 1 2 3 4; do
+            out=$(curl -s -w '\n%{http_code}' -m 120 "$URL" || true)
+            code=$(printf '%s' "$out" | tail -n1)
+            body=$(printf '%s' "$out" | head -c 300 | tr -d '\n')
+            echo "attempt $i -> HTTP $code | $body"
+            if [ "$code" = "200" ]; then
+              echo "Space 在线，计时器已清零。"
+              exit 0
+            fi
+            echo "未拿到 200（可能正在冷启动），20 秒后重试"
+            sleep 20
+          done
+          echo "本轮未拿到 200，下一次定时任务会再试。"
+          exit 0
